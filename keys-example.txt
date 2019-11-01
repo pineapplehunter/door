@@ -1,0 +1,3 @@
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  <- example key
+
+put your keys in this file and rename this file to "keys.txt"
