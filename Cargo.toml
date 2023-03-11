@@ -9,5 +9,5 @@ edition = "2018"
 [dependencies]
 rppal = "0.11.3"
 libreauth = "0.11.0"
-rocket = {version = "0.4.2", default-features = false}
+rocket = {version = "0.4.7", default-features = false}
 rocket_contrib = {version="0.4.2", features=["handlebars_templates"]}
