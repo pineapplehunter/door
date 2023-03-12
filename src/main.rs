@@ -1,110 +1,158 @@
-#![feature(decl_macro)]
-#![feature(proc_macro_hygiene)]
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use std::error::Error;
+use axum::{
+    routing::{get, post},
+    Router,
+};
+use std::thread::sleep;
+use tokio::sync::mpsc::{channel, Receiver};
+use tracing::info;
 
-const GPIO_PWM: u8 = 23;
-const GPIO_REED_SWITCH: u8 = 24;
+use crate::{
+    doorlock::{DoorLock, DoorLockTrait},
+    handlers::ServerState,
+    key_management::load_keys,
+};
 
-mod hardware;
+mod doorlock;
 
-use crate::hardware::doorlock::DoorLock;
-use libreauth::oath::TOTPBuilder;
-use rocket::request::Form;
-use rocket::response::Redirect;
-use rocket::{get, post, routes, uri, FromForm, State};
-use rocket_contrib::templates::Template;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+#[derive(Debug)]
+pub struct Open;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let keys = load_keys()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
 
-    println!("{:?}", keys);
+    let keys = load_keys().await?;
+    info!("keys={keys:?}");
 
-    let door_lock = DoorLock::new(GPIO_PWM, GPIO_REED_SWITCH);
+    let (tx, rx) = channel::<Open>(10);
 
-    rocket::ignite()
-        .manage(DoorState {
-            door: Arc::new(Mutex::new(door_lock)),
-            keys: Arc::new(keys),
-        })
-        .mount("/", routes![index, page_post])
-        .attach(Template::fairing())
-        .launch();
+    tokio::spawn(hardware_thread(rx));
 
+    let app = Router::new()
+        .route("/", get(handlers::index))
+        .route("/", post(handlers::check_key))
+        .with_state(ServerState {
+            keys,
+            open_sender: tx,
+        });
+
+    let addr = std::env::var("DOOR_PORT")
+        .unwrap_or("0.0.0.0:8000".to_string())
+        .parse()?;
+    info!("listening on {}", addr);
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
     Ok(())
 }
 
-struct DoorState {
-    door: Arc<Mutex<DoorLock>>,
-    keys: Arc<Vec<String>>,
-}
-
-#[derive(FromForm)]
-struct Pincode {
-    number: String,
-}
-
-#[get("/?<msg>")]
-fn index(msg: Option<String>) -> Template {
-    let mut context = HashMap::new();
-    if let Some(e) = msg {
-        context.insert("error".to_string(), e);
-    }
-    Template::render("index", context)
-}
-
-#[post("/", data = "<pincode>")]
-fn page_post(pincode: Form<Pincode>, state: State<DoorState>) -> Redirect {
-    if is_valid(&pincode.number, &*state.keys) {
-        let doorlock = state.door.clone();
-        thread::spawn(move || {
-            if let Ok(mut door) = doorlock.try_lock() {
-                door.open().unwrap();
-                thread::sleep(Duration::from_secs(5));
-
-                while door.is_open().unwrap() {
-                    thread::sleep(Duration::from_secs(1));
-                    dbg!("door open!");
+async fn hardware_thread(rx: Receiver<Open>) {
+    use tokio::task::spawn_blocking;
+    info!("starting hardware thread");
+    let mut rx = rx;
+    let door_lock = Arc::new(Mutex::new(DoorLock::new()));
+    while rx.recv().await.is_some() {
+        let door_lock = door_lock.clone();
+        spawn_blocking(move || {
+            let mut door_lock = door_lock.lock().unwrap();
+            door_lock.open();
+            sleep(Duration::from_secs(10));
+            loop {
+                while door_lock.is_open() {
+                    sleep(Duration::from_secs(1));
                 }
-                dbg!("door closed!");
-                thread::sleep(Duration::from_secs(3));
-                door.close().unwrap();
+                sleep(Duration::from_secs(3));
+                if !door_lock.is_open() {
+                    break;
+                }
             }
-        });
-        Redirect::to(uri!(index: msg = "OK"))
-    } else {
-        Redirect::to(uri!(index: msg = "コードが間違っています"))
+            door_lock.close();
+        })
+        .await
+        .unwrap();
     }
 }
 
-fn is_valid(number: &str, keys: &[String]) -> bool {
-    if number.len() != 6 {
-        return false;
+mod handlers {
+    use std::collections::HashMap;
+
+    use axum::{
+        extract::State,
+        response::{Html, IntoResponse},
+        Form,
+    };
+    use serde::Deserialize;
+    use tokio::sync::mpsc::Sender;
+
+    use crate::{key_management::key_is_valid, Open};
+
+    pub async fn index() -> impl IntoResponse {
+        render_page(None)
     }
-    for key in keys {
-        let code = TOTPBuilder::new()
-            .base32_key(&key)
-            .finalize()
-            .unwrap()
-            .generate();
-        if *number == code {
-            return true;
+
+    #[derive(Debug, Deserialize)]
+    pub struct PinCode {
+        number: String,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct ServerState {
+        pub keys: Vec<String>,
+        pub open_sender: Sender<Open>,
+    }
+
+    pub async fn check_key(
+        State(ServerState { keys, open_sender }): State<ServerState>,
+        Form(code): Form<PinCode>,
+    ) -> impl IntoResponse {
+        if key_is_valid(&code.number, &keys) {
+            open_sender.send(Open).await.unwrap();
+            render_page(Some("OK".to_string()))
+        } else {
+            render_page(Some("パスコードが間違っています".to_string()))
         }
     }
-    false
+
+    fn render_page(message: Option<String>) -> Html<String> {
+        static TEMPLATE: &str = include_str!("index.hbs");
+        let hb = handlebars::Handlebars::new();
+        let mut data = HashMap::new();
+        if let Some(m) = message {
+            data.insert("message", m);
+        }
+        Html::from(hb.render_template(TEMPLATE, &data).unwrap())
+    }
 }
-fn load_keys() -> Result<Vec<String>, std::io::Error> {
-    let mut data = String::new();
-    File::open("keys.txt")?.read_to_string(&mut data)?;
-    Ok(data
-        .split('\n')
-        .filter(|x| x.len() == 32)
-        .map(|x| x.to_owned())
-        .collect())
+
+mod key_management {
+    use libreauth::oath::TOTPBuilder;
+    use tokio::fs::read_to_string;
+
+    pub async fn load_keys() -> Result<Vec<String>, std::io::Error> {
+        let data = read_to_string("keys.txt").await?;
+        Ok(data
+            .split('\n')
+            .filter(|x| x.len() == 32)
+            .map(|x| x.to_owned())
+            .collect())
+    }
+
+    pub fn key_is_valid(number: &str, keys: &[String]) -> bool {
+        if number.len() != 6 {
+            return false;
+        }
+        keys.iter().any(|key| {
+            TOTPBuilder::new()
+                .base32_key(key)
+                .finalize()
+                .unwrap()
+                .is_valid(number)
+        })
+    }
 }
